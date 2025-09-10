@@ -1,297 +1,257 @@
-# database.py
+"""
+database.py - Gestión de bases de datos para resultados y caché WHOIS
+Integrado con search.py y whois_lookup.py
+"""
+
 import sqlite3
 import json
-from datetime import datetime, timedelta
 import logging
+from datetime import datetime
+import csv
+from typing import Any, Dict, Optional, List
 
-logging.basicConfig(
-    filename="app.log",
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logger = logging.getLogger(__name__)
 
-DB_WHOIS = "whois_cache.db"
+# Rutas de las bases de datos
 DB_RESULTS = "phishing_results.db"
+DB_CACHE = "whois_cache.db"
 
+# =============================
+# Inicialización de las bases
+# =============================
 
 def init_db():
-    """Inicializa las bases de datos SQLite para caché WHOIS y resultados."""
-    try:
-        # Base de datos WHOIS
-        conn = sqlite3.connect(DB_WHOIS)
+    """Inicializa ambas bases de datos."""
+    _init_results_db()
+    _init_cache_db()
+
+
+def _connect(db_path: str):
+    """Crea conexión SQLite con buenas configuraciones de rendimiento."""
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+
+def _init_results_db():
+    with _connect(DB_RESULTS) as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS domain_info (
-                base_domain TEXT PRIMARY KEY,
-                url TEXT,
-                domain TEXT,
-                title TEXT,
-                snippet TEXT,
-                registrar TEXT,
-                creation_date TEXT,
-                expiration_date TEXT,
-                country TEXT,
-                emails TEXT,
-                mx_records TEXT,
-                mx_count INTEGER,
-                ip TEXT,
-                ttl INTEGER,
-                ns_records TEXT,
-                ns_count INTEGER,
-                filtered BOOLEAN,
-                reasons TEXT,
-                score INTEGER,
-                whitelisted BOOLEAN,
-                is_legit_subdomain BOOLEAN,
-                cached_at TEXT,
-                error TEXT
-            )
+        CREATE TABLE IF NOT EXISTS phishing_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT,
+            normalized_url TEXT UNIQUE,
+            domain TEXT,
+            keyword TEXT,
+            title TEXT,
+            snippet TEXT,
+            reasons TEXT,
+            score INTEGER,
+            suspicious INTEGER DEFAULT 0,
+            filtered INTEGER DEFAULT 0,
+            whitelisted INTEGER DEFAULT 0,
+            registrar TEXT,
+            creation_date TEXT,
+            expiration_date TEXT,
+            ns_records TEXT,
+            mx_records TEXT,
+            last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
         """)
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_normalized_url ON phishing_results(normalized_url)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_keyword ON phishing_results(keyword)")
         conn.commit()
-        conn.close()
 
-        # Base de datos resultados phishing
-        conn = sqlite3.connect(DB_RESULTS)
+
+def _init_cache_db():
+    with _connect(DB_CACHE) as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS phishing_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                keyword TEXT,
-                url TEXT,
-                normalized_url TEXT UNIQUE,
-                base_domain TEXT,
-                title TEXT,
-                snippet TEXT,
-                suspicious BOOLEAN,
-                reasons TEXT,
-                score INTEGER,
-                whitelisted BOOLEAN,
-                is_legit_subdomain BOOLEAN,
-                registrar TEXT,
-                creation_date TEXT,
-                expiration_date TEXT,
-                country TEXT,
-                emails TEXT,
-                mx_records TEXT,
-                mx_count INTEGER,
-                ip TEXT,
-                ttl INTEGER,
-                ns_records TEXT,
-                ns_count INTEGER
-            )
-        """)
-        # Índice adicional para búsquedas rápidas por normalized_url
-        cursor.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_normalized_url
-            ON phishing_results(normalized_url)
+        CREATE TABLE IF NOT EXISTS whois_cache (
+            domain TEXT PRIMARY KEY,
+            data TEXT,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
         """)
         conn.commit()
-        conn.close()
 
-        logging.info("Bases de datos SQLite inicializadas correctamente.")
-    except Exception as e:
-        logging.error(f"Error inicializando bases de datos: {e}")
+# =============================
+# Utilidades internas
+# =============================
 
-
-def _row_to_domain_info(row):
-    if not row:
+def _normalize_date(date_value: Any) -> Optional[str]:
+    """Convierte fecha WHOIS a string ISO. Acepta datetime, str o None."""
+    if not date_value:
         return None
-    return {
-        "base_domain": row[0],
-        "url": row[1],
-        "domain": row[2],
-        "title": row[3],
-        "snippet": row[4],
-        "registrar": row[5],
-        "creation_date": row[6],
-        "expiration_date": row[7],
-        "country": row[8],
-        "emails": json.loads(row[9]) if row[9] else [],
-        "mx_records": json.loads(row[10]) if row[10] else [],
-        "mx_count": row[11],
-        "ip": json.loads(row[12]) if row[12] else [],
-        "ttl": row[13],
-        "ns_records": json.loads(row[14]) if row[14] else [],
-        "ns_count": row[15],
-        "filtered": bool(row[16]),
-        "reasons": json.loads(row[17]) if row[17] else [],
-        "score": row[18],
-        "whitelisted": bool(row[19]),
-        "is_legit_subdomain": bool(row[20]),
-        "cached_at": row[21],
-        "error": row[22]
-    }
-
-
-def get_cached_domain_info(base_domain, cache_expiry_days=90):
-    """Recupera información de dominio desde el caché SQLite. Evalúa expiración en Python."""
-    try:
-        conn = sqlite3.connect(DB_WHOIS)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM domain_info WHERE base_domain = ?", (base_domain,))
-        row = cursor.fetchone()
-        conn.close()
-        if not row:
-            logging.debug(f"No cache record for {base_domain}")
-            return None
-        info = _row_to_domain_info(row)
+    if isinstance(date_value, datetime):
+        return date_value.strftime("%Y-%m-%dT%H:%M:%S")
+    if isinstance(date_value, str):
         try:
-            cached_at = datetime.fromisoformat(info["cached_at"])
-            if cached_at >= datetime.now() - timedelta(days=cache_expiry_days):
-                logging.info(f"Usando caché SQLite para {base_domain}")
-                return info
-            else:
-                logging.debug(f"Caché expirado para {base_domain}")
-                return None
-        except Exception as e:
-            logging.warning(f"Error parseando cached_at para {base_domain}: {e}")
-            return None
-    except Exception as e:
-        logging.error(f"Error al consultar caché para {base_domain}: {e}")
-        return None
+            dt = datetime.fromisoformat(date_value.replace("Z", ""))
+            return dt.strftime("%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            return date_value
+    return str(date_value)
 
 
-def save_domain_info(info):
-    """Guarda información de dominio en el caché SQLite."""
+def _safe_load_reasons(reasons: Any) -> list:
+    """Convierte campo reasons a lista de strings válida."""
+    if not reasons:
+        return []
+    if isinstance(reasons, list):
+        return [str(r) for r in reasons if r]
+    if isinstance(reasons, str):
+        try:
+            parsed = json.loads(reasons)
+            if isinstance(parsed, list):
+                return [str(r) for r in parsed if r]
+        except Exception:
+            return [reasons]
+    return [str(reasons)]
+
+# =============================
+# Funciones principales
+# =============================
+
+def save_result(result: Dict[str, Any]):
+    """Guarda o actualiza un resultado en phishing_results."""
+    if not result.get("keyword") or not result.get("normalized_url"):
+        logger.warning("Resultado incompleto descartado: %s", result)
+        return
+
+    score = result.get("score") or 0
     try:
-        conn = sqlite3.connect(DB_WHOIS)
+        score = max(0, int(score))
+    except Exception:
+        score = 0
+
+    with _connect(DB_RESULTS) as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO domain_info (
-                base_domain, url, domain, title, snippet, registrar, creation_date, 
-                expiration_date, country, emails, mx_records, mx_count, ip, ttl, 
-                ns_records, ns_count, filtered, reasons, score, whitelisted, 
-                is_legit_subdomain, cached_at, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO phishing_results (
+            url, normalized_url, domain, keyword, title, snippet,
+            reasons, score, suspicious, filtered, whitelisted,
+            registrar, creation_date, expiration_date,
+            ns_records, mx_records, last_checked
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(normalized_url) DO UPDATE SET
+            url=excluded.url,
+            domain=excluded.domain,
+            keyword=excluded.keyword,
+            title=excluded.title,
+            snippet=excluded.snippet,
+            reasons=excluded.reasons,
+            score=excluded.score,
+            suspicious=excluded.suspicious,
+            filtered=excluded.filtered,
+            whitelisted=excluded.whitelisted,
+            registrar=excluded.registrar,
+            creation_date=excluded.creation_date,
+            expiration_date=excluded.expiration_date,
+            ns_records=excluded.ns_records,
+            mx_records=excluded.mx_records,
+            last_checked=CURRENT_TIMESTAMP
         """, (
-            info.get("base_domain"),
-            info.get("url"),
-            info.get("domain"),
-            info.get("title"),
-            info.get("snippet"),
-            info.get("registrar"),
-            info.get("creation_date"),
-            info.get("expiration_date"),
-            info.get("country"),
-            json.dumps(info.get("emails", [])),
-            json.dumps(info.get("mx_records", [])),
-            info.get("mx_count", 0),
-            json.dumps(info.get("ip", [])),
-            info.get("ttl"),
-            json.dumps(info.get("ns_records", [])),
-            info.get("ns_count", 0),
-            int(bool(info.get("filtered", False))),
-            json.dumps(info.get("reasons", [])),
-            info.get("score", 0),
-            int(bool(info.get("whitelisted", False))),
-            int(bool(info.get("is_legit_subdomain", False))),
-            info.get("cached_at", datetime.now().isoformat()),
-            info.get("error")
-        ))
-        conn.commit()
-        conn.close()
-        logging.debug(f"Caché actualizado para {info.get('base_domain')}")
-    except Exception as e:
-        logging.error(f"Error al guardar en caché para {info.get('base_domain')}: {e}")
-
-
-def save_result(result):
-    """Guarda un resultado del pipeline en la base de datos SQLite (usa normalized_url para unicidad)."""
-    try:
-        conn = sqlite3.connect(DB_RESULTS)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT OR IGNORE INTO phishing_results (
-                keyword, url, normalized_url, base_domain, title, snippet, suspicious, reasons, score,
-                whitelisted, is_legit_subdomain, registrar, creation_date, expiration_date,
-                country, emails, mx_records, mx_count, ip, ttl, ns_records, ns_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            result.get("keyword"),
             result.get("url"),
             result.get("normalized_url"),
-            result.get("base_domain"),
+            result.get("domain"),
+            result.get("keyword"),
             result.get("title"),
             result.get("snippet"),
-            int(bool(result.get("suspicious"))),
-            result.get("reasons"),
-            result.get("score"),
-            int(bool(result.get("whitelisted"))),
-            int(bool(result.get("is_legit_subdomain"))),
+            json.dumps(_safe_load_reasons(result.get("reasons"))),
+            score,
+            int(result.get("suspicious", 0)),
+            int(result.get("filtered", 0)),
+            int(result.get("whitelisted", 0)),
             result.get("registrar"),
-            result.get("creation_date"),
-            result.get("expiration_date"),
-            result.get("country"),
-            json.dumps(result.get("emails", [])),
-            json.dumps(result.get("mx_records", [])),
-            result.get("mx_count", 0),
-            json.dumps(result.get("ip", [])),
-            result.get("ttl"),
-            json.dumps(result.get("ns_records", [])),
-            result.get("ns_count", 0)
+            _normalize_date(result.get("creation_date")),
+            _normalize_date(result.get("expiration_date")),
+            json.dumps(result.get("ns_records") or []),
+            json.dumps(result.get("mx_records") or []),
         ))
         conn.commit()
-        conn.close()
-        logging.debug(f"Resultado guardado para {result.get('normalized_url')}")
-    except Exception as e:
-        logging.error(f"Error al guardar resultado para {result.get('normalized_url')}: {e}")
+        logger.info("Guardado resultado para dominio %s", result.get("domain"))
 
-
-def get_suspicious_results(min_score=50):
-    """Consulta resultados sospechosos desde la base de datos SQLite."""
-    try:
-        conn = sqlite3.connect(DB_RESULTS)
+def save_domain_info(domain: str, info: Dict[str, Any]):
+    """Guarda información WHOIS en caché."""
+    with _connect(DB_CACHE) as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT * FROM phishing_results WHERE suspicious = 1 AND score >= ?
+        INSERT INTO whois_cache (domain, data, last_updated)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(domain) DO UPDATE SET
+            data=excluded.data,
+            last_updated=CURRENT_TIMESTAMP
+        """, (domain, json.dumps(info)))
+        conn.commit()
+
+
+def get_cached_domain_info(domain: str, max_age_days: int = 7) -> Optional[Dict[str, Any]]:
+    """Recupera datos WHOIS de caché si no están caducados."""
+    with _connect(DB_CACHE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT data, last_updated FROM whois_cache WHERE domain = ?", (domain,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        data, last_updated = row
+        try:
+            last_dt = datetime.fromisoformat(last_updated)
+            if (datetime.now() - last_dt).days > max_age_days:
+                return None
+        except Exception:
+            return None
+        try:
+            return json.loads(data)
+        except Exception:
+            return None
+
+
+def get_processed_urls() -> Dict[str, str]:
+    """
+    Devuelve un dict {normalized_url: keyword} de URLs ya procesadas en la DB.
+    """
+    with _connect(DB_RESULTS) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT normalized_url, keyword FROM phishing_results")
+        rows = cursor.fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+def get_suspicious_results(min_score: int = 50) -> List[Dict[str, Any]]:
+    """
+    Devuelve todos los resultados sospechosos con score >= min_score.
+    """
+    with _connect(DB_RESULTS) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT * FROM phishing_results
+        WHERE suspicious = 1 AND score >= ?
+        ORDER BY score DESC
         """, (min_score,))
         rows = cursor.fetchall()
-        conn.close()
-        results = []
-        for row in rows:
-            results.append({
-                "id": row[0],
-                "keyword": row[1],
-                "url": row[2],
-                "normalized_url": row[3],
-                "base_domain": row[4],
-                "title": row[5],
-                "snippet": row[6],
-                "suspicious": bool(row[7]),
-                "reasons": row[8],
-                "score": row[9],
-                "whitelisted": bool(row[10]),
-                "is_legit_subdomain": bool(row[11]),
-                "registrar": row[12],
-                "creation_date": row[13],
-                "expiration_date": row[14],
-                "country": row[15],
-                "emails": json.loads(row[16]) if row[16] else [],
-                "mx_records": json.loads(row[17]) if row[17] else [],
-                "mx_count": row[18],
-                "ip": json.loads(row[19]) if row[19] else [],
-                "ttl": row[20],
-                "ns_records": json.loads(row[21]) if row[21] else [],
-                "ns_count": row[22]
-            })
-        logging.info(f"Consultados {len(results)} resultados sospechosos con score >= {min_score}")
-        return results
-    except Exception as e:
-        logging.error(f"Error al consultar resultados sospechosos: {e}")
-        return []
+    return [dict(row) for row in rows]
 
 
-def get_processed_urls():
-    """Recupera todas las normalized_urls procesadas desde phishing_results.db."""
-    try:
-        conn = sqlite3.connect(DB_RESULTS)
+def export_results_to_csv(filepath: str = "results.csv"):
+    """Exporta todos los resultados a un archivo CSV."""
+    with _connect(DB_RESULTS) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT normalized_url, base_domain FROM phishing_results")
-        rows = cursor.fetchall()
-        conn.close()
-        processed = {row[0]: row[1] for row in rows if row[0]}
-        logging.info(f"Recuperadas {len(processed)} URLs procesadas")
-        return processed
-    except Exception as e:
-        logging.error(f"Error al recuperar URLs procesadas: {e}")
-        return {}
+        rows = cursor.execute("SELECT * FROM phishing_results").fetchall()
+        headers = [desc[0] for desc in cursor.description]
+
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+    logger.info("Exportados %d resultados a %s", len(rows), filepath)
+
+
+# =============================
+# Inicialización al importar
+# =============================
+
+init_db()
